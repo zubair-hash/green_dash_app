@@ -10,15 +10,135 @@ import plotly.express as px
 import plotly.figure_factory as ff
 import numpy as np
 import dash_bootstrap_components as dbc
+import paramiko
+import stat
+from dotenv import load_dotenv
 from pathlib import Path
 
-CURRENT_DATA_DIR = Path("/data/Current/XX03.nmea")
-WAVE_DATA_DIR    = Path("/data/Wave/COM3_2024_09_21.txt")
-WIND_DATA_DIR    = Path("/data/Lidar")
+# Load environment variables from .env file
+load_dotenv()
 
+# Define SFTP credentials and connection parameters from environment variables
+sftp_host = os.getenv('SFTP_HOST')
+sftp_username = os.getenv('SFTP_USERNAME')
+sftp_password = os.getenv('SFTP_PASSWORD')
+remote_base_path = os.getenv('REMOTE_FILE_PATH')  # Base path for the main directory
 
-# Create the output directory if it doesn't exist
-# os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Define the local directory where you want to save the files (ephemeral on Heroku)
+local_base_directory = Path("./data")
+
+def get_remote_file_info(sftp, file_path):
+    """Fetch the remote file's modification time."""
+    file_attributes = sftp.stat(file_path)
+    return file_attributes.st_mtime
+
+def get_local_file_info(local_file_path):
+    """Fetch the local file's modification time if it exists."""
+    if local_file_path.exists():
+        return local_file_path.stat().st_mtime
+    return None
+
+def is_file_updated(local_mtime, remote_mtime):
+    """Compare local and remote modification times."""
+    if local_mtime is None:
+        return True  # Local file doesn't exist, so consider it "outdated"
+    return remote_mtime > local_mtime
+
+def download_file(sftp, remote_file, local_file):
+    """Download the file from the remote server."""
+    sftp.get(remote_file, str(local_file))
+    print(f"Downloaded {remote_file} to {local_file}")
+
+def is_directory(sftp, path):
+    """Check if the path is a directory on the remote server."""
+    try:
+        return stat.S_ISDIR(sftp.stat(path).st_mode)
+    except IOError:
+        return False
+
+def mirror_directory_structure(sftp, remote_dir, local_dir):
+    """Mirror the remote directory structure locally."""
+    try:
+        if not local_dir.exists():
+            local_dir.mkdir(parents=True)
+            print(f"Created local directory: {local_dir}")
+        
+        for item in sftp.listdir(remote_dir):
+            remote_item_path = f"{remote_dir}/{item}"
+            local_item_path = local_dir / item
+
+            # If the item is a directory, recurse into it
+            if is_directory(sftp, remote_item_path):
+                mirror_directory_structure(sftp, remote_item_path, local_item_path)
+            else:
+                # Skip for now, files will be downloaded in a separate process
+                pass
+
+    except Exception as e:
+        print(f"An error occurred while mirroring directory structure: {e}")
+
+def check_subdirectory(sftp, remote_dir, local_dir):
+    """Check and download updated files from a specific subdirectory."""
+    directory_contents = sftp.listdir(remote_dir)
+
+    if len(directory_contents) == 0:
+        print(f"No Data Available in {remote_dir}.")
+    else:
+        print(f"Checking for updated files in {local_dir}...")
+
+        for item in directory_contents:
+            remote_file = f"{remote_dir}/{item}"
+            local_file = local_dir / item
+
+            if is_directory(sftp, remote_file):
+                check_subdirectory(sftp, remote_file, local_file)
+            else:
+                remote_mtime = get_remote_file_info(sftp, remote_file)
+                local_mtime = get_local_file_info(local_file)
+
+                if is_file_updated(local_mtime, remote_mtime):
+                    print(f"Newer version found for {item}. Downloading...")
+                    download_file(sftp, remote_file, local_file)
+                else:
+                    print(f"{item} is already up to date.")
+
+def process_data():
+    """Main function to check and download updated data."""
+    try:
+        # Initialize SSH client
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        # Connect to the SFTP server
+        ssh.connect(sftp_host, username=sftp_username, password=sftp_password)
+
+        # Open an SFTP session
+        sftp = ssh.open_sftp()
+
+        print("Connected successfully to the SFTP server.")
+
+        # Change to the base remote directory
+        sftp.chdir(remote_base_path)
+
+        # Mirror the entire directory structure before downloading any files
+        mirror_directory_structure(sftp, remote_base_path, local_base_directory)
+
+        # Now, proceed to check and download updated files from each subdirectory
+        check_subdirectory(sftp, remote_base_path, local_base_directory)
+
+        # Close the SFTP session and SSH connection
+        sftp.close()
+        ssh.close()
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# Call the main process function to perform the data check and download
+process_data()
+
+CURRENT_DATA_DIR = local_base_directory / "Current/XX03.nmea"
+WAVE_DATA_DIR = local_base_directory / "Wave/COM3_2024_09_21.txt"
+WIND_DATA_DIR = local_base_directory / "Lidar"
 
 def process_currents_data(file_path):
     # Read the NMEA file
@@ -35,33 +155,27 @@ def process_currents_data(file_path):
     df.replace('', pd.NA, inplace=True)  # Replace empty strings with NaN
     df.dropna(axis=1, how='all', inplace=True)
 
-    # Define column names
     column_names = [
         "Identifier", "Date", "Time", "Cell number", "Velocity 1 (m/s)", "Velocity 2 (m/s)", 
         "Velocity 3 (m/s)", "Speed (m/s)", "Direction (°)", "Amplitude units", 
         "Correlation 1 (%)", "Correlation 2 (%)", "Correlation 3 (%)", "Checksum (hex)"
     ]
 
-    # Set the column names based on the shape of the DataFrame
     if df.shape[1] <= len(column_names):
         df.columns = column_names[:df.shape[1]]
     else:
         print("DataFrame has unexpected number of columns:", df.shape[1])
-        print(df.head())  # Print a preview of the data to check structure
+        print(df.head())
         return
 
-    # Debugging: Print columns to check if Date and Time exist
-    # print("Columns:", df.columns)
-
-    # Convert date and time into datetime
     def convert_to_datetime(row):
         date_str = str(row['Date'])
         if len(date_str) > 5:
             date_str = date_str[-5:]
 
-        month = date_str[0].zfill(2)  # Month
-        day = date_str[1:3]           # Day
-        year = "20" + date_str[3:]    # Year
+        month = date_str[0].zfill(2)
+        day = date_str[1:3]
+        year = "20" + date_str[3:]
         
         time_str = str(row['Time']).zfill(6)
         hours = time_str[:2]
@@ -71,7 +185,6 @@ def process_currents_data(file_path):
         datetime_str = f"{year}-{month}-{day} {hours}:{minutes}:{seconds}"
         return pd.Timestamp(datetime_str)
 
-    # Ensure the 'Date' and 'Time' columns exist before applying the function
     if 'Date' in df.columns and 'Time' in df.columns:
         df['Datetime'] = df.apply(convert_to_datetime, axis=1)
     else:
@@ -80,41 +193,31 @@ def process_currents_data(file_path):
 
     return df
 
-
-# Function to process wave data from .txt file
 def process_wave_data(file_path):
-    # Read the .txt file
     with open(file_path, 'r') as f:
         lines = f.readlines()
 
-    # Remove empty lines and split by commas
     data = [line.strip().split(',') for line in lines if line.strip()]
 
-    # Convert to DataFrame
     df = pd.DataFrame(data)
 
-    # Rename columns
-    column_names = ['identifier','NMEA', 'CompassHeading','Hs','DominantPeriod','DominantPeriodFW'] + [f'parameter{i}' for i in range(6, 22)] + ['Datetime', 'parameter22']
+    column_names = ['identifier', 'NMEA', 'CompassHeading', 'Hs', 'DominantPeriod', 'DominantPeriodFW'] + \
+                   [f'parameter{i}' for i in range(6, 22)] + ['Datetime', 'parameter22']
     df.columns = column_names
     
     return df
 
-# Function to process wind data
 def process_wind_data(wind_data_dir):
-    # Create a pattern to match all CSV files in the wind data directory
-    csv_pattern = os.path.join(wind_data_dir, 'Wind10_829@Y2024_M09_D*.ZPH.csv')
+    csv_pattern = str(wind_data_dir / 'Wind10_829@Y2024_M09_D*.ZPH.csv')
     
-    # Use glob to get all file paths matching the pattern
     all_files = glob.glob(csv_pattern)
     
     if not all_files:
         print("No wind data files found!")
         return
     
-    # Read each CSV file and concatenate into a single DataFrame
     wind_data = pd.concat((pd.read_csv(f, skiprows=1) for f in all_files), ignore_index=True)
 
-    # Replace 9999 values with NaN and apply forward and backward fill
     wind_data.replace(9999, np.nan, inplace=True)
     wind_data.ffill(inplace=True)
     wind_data.bfill(inplace=True)
@@ -493,10 +596,9 @@ def update_hs_kde(_):
         yaxis_title='Density',
         margin={"r":10, "t":30, "l":10, "b":20}
     )
-
     return fig
 
 
 # Start the app
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run_server(debug=False)

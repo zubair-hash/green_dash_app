@@ -242,18 +242,14 @@ waves_columns = waves_data.columns[1:6]
 # Load wind data
 wind_data = process_wind_data(WIND_DATA_DIR)
 
-# Correctly parse the 'Time and Date' column into datetime format
-wind_data['Datetime'] = pd.to_datetime(wind_data['Time and Date'], format='%d-%m-%Y %H:%M:%S', errors='coerce')
-
-# Remove duplicate rows
-wind_data.drop_duplicates(inplace=True)
+# Correctly parse the 'Time and Date' column as datetime
+wind_data['datetime'] = pd.to_datetime(wind_data['Time and Date'], errors='coerce')
 
 # Split GPS column into latitude and longitude
 wind_data[['latitude', 'longitude']] = wind_data['GPS'].str.split(' ', expand=True).astype(float)
 
 # Heights for wind speed and wind direction
 heights = [257, 227, 197, 177, 157, 137, 127, 107, 87, 57, 38]
-
 
 
 

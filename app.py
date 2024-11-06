@@ -14,6 +14,7 @@ import paramiko
 import stat
 from dotenv import load_dotenv
 from pathlib import Path
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # Load environment variables from .env file
 load_dotenv()
@@ -40,9 +41,7 @@ def get_local_file_info(local_file_path):
 
 def is_file_updated(local_mtime, remote_mtime):
     """Compare local and remote modification times."""
-    if local_mtime is None:
-        return True  # Local file doesn't exist, so consider it "outdated"
-    return remote_mtime > local_mtime
+    return local_mtime is None or remote_mtime > local_mtime
 
 def download_file(sftp, remote_file, local_file):
     """Download the file from the remote server."""
@@ -58,101 +57,64 @@ def is_directory(sftp, path):
 
 def mirror_directory_structure(sftp, remote_dir, local_dir):
     """Mirror the remote directory structure locally."""
-    try:
-        if not local_dir.exists():
-            local_dir.mkdir(parents=True)
-            print(f"Created local directory: {local_dir}")
-        
-        for item in sftp.listdir(remote_dir):
-            remote_item_path = f"{remote_dir}/{item}"
-            local_item_path = local_dir / item
+    if not local_dir.exists():
+        local_dir.mkdir(parents=True)
+        print(f"Created local directory: {local_dir}")
 
-            # If the item is a directory, recurse into it
-            if is_directory(sftp, remote_item_path):
-                mirror_directory_structure(sftp, remote_item_path, local_item_path)
-            else:
-                # Skip for now, files will be downloaded in a separate process
-                pass
+    for item in sftp.listdir(remote_dir):
+        remote_item_path = f"{remote_dir}/{item}"
+        local_item_path = local_dir / item
 
-    except Exception as e:
-        print(f"An error occurred while mirroring directory structure: {e}")
+        if is_directory(sftp, remote_item_path):
+            mirror_directory_structure(sftp, remote_item_path, local_item_path)
+        else:
+            pass
 
 def check_subdirectory(sftp, remote_dir, local_dir):
     """Check and download updated files from a specific subdirectory."""
     directory_contents = sftp.listdir(remote_dir)
 
-    if len(directory_contents) == 0:
-        print(f"No Data Available in {remote_dir}.")
-    else:
-        print(f"Checking for updated files in {local_dir}...")
+    for item in directory_contents:
+        remote_file = f"{remote_dir}/{item}"
+        local_file = local_dir / item
 
-        for item in directory_contents:
-            remote_file = f"{remote_dir}/{item}"
-            local_file = local_dir / item
+        if is_directory(sftp, remote_file):
+            check_subdirectory(sftp, remote_file, local_file)
+        else:
+            remote_mtime = get_remote_file_info(sftp, remote_file)
+            local_mtime = get_local_file_info(local_file)
 
-            if is_directory(sftp, remote_file):
-                check_subdirectory(sftp, remote_file, local_file)
-            else:
-                remote_mtime = get_remote_file_info(sftp, remote_file)
-                local_mtime = get_local_file_info(local_file)
-
-                if is_file_updated(local_mtime, remote_mtime):
-                    print(f"Newer version found for {item}. Downloading...")
-                    download_file(sftp, remote_file, local_file)
-                else:
-                    print(f"{item} is already up to date.")
+            if is_file_updated(local_mtime, remote_mtime):
+                download_file(sftp, remote_file, local_file)
 
 def process_data():
     """Main function to check and download updated data."""
     try:
-        # Initialize SSH client
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        # Connect to the SFTP server
         ssh.connect(sftp_host, username=sftp_username, password=sftp_password)
-
-        # Open an SFTP session
         sftp = ssh.open_sftp()
 
-        print("Connected successfully to the SFTP server.")
-
-        # Change to the base remote directory
         sftp.chdir(remote_base_path)
-
-        # Mirror the entire directory structure before downloading any files
         mirror_directory_structure(sftp, remote_base_path, local_base_directory)
-
-        # Now, proceed to check and download updated files from each subdirectory
         check_subdirectory(sftp, remote_base_path, local_base_directory)
 
-        # Close the SFTP session and SSH connection
         sftp.close()
         ssh.close()
 
     except Exception as e:
         print(f"An error occurred: {e}")
 
-# Call the main process function to perform the data check and download
-process_data()
-
 CURRENT_DATA_DIR = local_base_directory / "Current/XX03.nmea"
 WAVE_DATA_DIR = local_base_directory / "Wave/COM3_2024_09_21.txt"
 WIND_DATA_DIR = local_base_directory / "Lidar"
 
 def process_currents_data(file_path):
-    # Read the NMEA file
     with open(file_path, 'r') as f:
         lines = f.readlines()
-
-    # Filter for lines that start with $PNORC and split by commas
     data = [line.strip().split(',') for line in lines if line.startswith('$PNORC')]
-
-    # Convert to DataFrame
     df = pd.DataFrame(data)
-
-    # Drop empty columns (columns with all NaN or empty values)
-    df.replace('', pd.NA, inplace=True)  # Replace empty strings with NaN
+    df.replace('', pd.NA, inplace=True)
     df.dropna(axis=1, how='all', inplace=True)
 
     column_names = [
@@ -164,65 +126,53 @@ def process_currents_data(file_path):
     if df.shape[1] <= len(column_names):
         df.columns = column_names[:df.shape[1]]
     else:
-        print("DataFrame has unexpected number of columns:", df.shape[1])
-        print(df.head())
         return
 
     def convert_to_datetime(row):
-        date_str = str(row['Date'])
-        if len(date_str) > 5:
-            date_str = date_str[-5:]
-
+        date_str = str(row['Date'])[-5:]
         month = date_str[0].zfill(2)
         day = date_str[1:3]
         year = "20" + date_str[3:]
-        
         time_str = str(row['Time']).zfill(6)
         hours = time_str[:2]
         minutes = time_str[2:4]
         seconds = time_str[4:]
-
         datetime_str = f"{year}-{month}-{day} {hours}:{minutes}:{seconds}"
         return pd.Timestamp(datetime_str)
 
     if 'Date' in df.columns and 'Time' in df.columns:
         df['Datetime'] = df.apply(convert_to_datetime, axis=1)
-    else:
-        print("Missing 'Date' or 'Time' columns in the DataFrame!")
-        return
-
     return df
 
 def process_wave_data(file_path):
     with open(file_path, 'r') as f:
         lines = f.readlines()
-
     data = [line.strip().split(',') for line in lines if line.strip()]
-
     df = pd.DataFrame(data)
-
     column_names = ['identifier', 'NMEA', 'CompassHeading', 'Hs', 'DominantPeriod', 'DominantPeriodFW'] + \
                    [f'parameter{i}' for i in range(6, 22)] + ['Datetime', 'parameter22']
     df.columns = column_names
-    
     return df
 
 def process_wind_data(wind_data_dir):
     csv_pattern = str(wind_data_dir / 'Wind10_829@Y2024_M09_D*.ZPH.csv')
-    
     all_files = glob.glob(csv_pattern)
-    
     if not all_files:
-        print("No wind data files found!")
         return
-    
     wind_data = pd.concat((pd.read_csv(f, skiprows=1) for f in all_files), ignore_index=True)
-
     wind_data.replace(9999, np.nan, inplace=True)
     wind_data.ffill(inplace=True)
     wind_data.bfill(inplace=True)
-
     return wind_data
+
+def scheduled_task():
+    print("Running scheduled data processing at 00:00 am")
+    process_data()
+
+# Set up the scheduler
+# scheduler = BackgroundScheduler()
+# scheduler.add_job(scheduled_task, 'cron', hour=13, minute=32)
+# scheduler.start()
 
 # Load currents data
 currents_data = process_currents_data(CURRENT_DATA_DIR) # comment if you are loading fron the folder
@@ -600,6 +550,9 @@ def update_hs_kde(_):
 
 # Start the app
 if __name__ == "__main__":
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(scheduled_task, 'cron', hour=13, minute=32)
+    scheduler.start()
     app.run_server(debug=False)
     # port = int(os.environ.get("PORT", 8050))
     # app.run_server(host="0.0.0.0", port=port)

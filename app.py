@@ -14,7 +14,10 @@ import paramiko
 import stat
 from dotenv import load_dotenv
 from pathlib import Path
-from apscheduler.schedulers.background import BackgroundScheduler
+# from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+import time
+import datetime
 
 # Load environment variables from .env file
 load_dotenv()
@@ -165,21 +168,40 @@ def process_wind_data(wind_data_dir):
     wind_data.bfill(inplace=True)
     return wind_data
 
-def scheduled_task():
-    print("Running scheduled data processing at 00:00 am")
-    process_data()
+currents_data = process_currents_data(CURRENT_DATA_DIR)
+waves_data = process_wave_data(WAVE_DATA_DIR)
+wind_data = process_wind_data(WIND_DATA_DIR)
 
-# Set up the scheduler
-# scheduler = BackgroundScheduler()
-# scheduler.add_job(scheduled_task, 'cron', hour=13, minute=32)
-# scheduler.start()
+def run_daily_task():
+    """Run the data loading task daily at 00:01 AM."""
+    while True:
+        now = datetime.datetime.now()
+        target_time = datetime.datetime.combine(now.date(), datetime.time(14, 0))  # 00:01 AM today
+        if now > target_time:
+            # If already past 00:01 AM today, set to 00:01 AM tomorrow
+            target_time += datetime.timedelta(days=1)
+        
+        # Calculate time to wait until target time
+        wait_time = (target_time - now).total_seconds()
+        print(f"Waiting {wait_time} seconds until the next run at {target_time}.")
+
+        time.sleep(wait_time)  # Wait until target time
+        process_data()         # Run the data loading function
+        currents_data = process_currents_data(CURRENT_DATA_DIR)
+        waves_data = process_wave_data(WAVE_DATA_DIR)
+        wind_data = process_wind_data(WIND_DATA_DIR)
+        
+
+# Initialize the app with Bootstrap theme
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SUPERHERO])
+server = app.server
 
 # Load currents data
-currents_data = process_currents_data(CURRENT_DATA_DIR) # comment if you are loading fron the folder
+# currents_data = process_currents_data(CURRENT_DATA_DIR) # comment if you are loading fron the folder
 currents_data['Datetime'] = pd.to_datetime(currents_data['Datetime'])
 
 # Load waves data
-waves_data = process_wave_data(WAVE_DATA_DIR) # comment if you are loading fron the folder
+# waves_data = process_wave_data(WAVE_DATA_DIR) # comment if you are loading fron the folder
 waves_data['Datetime'] = pd.to_datetime(waves_data['Datetime'])
 
 # List of columns for currents dropdown
@@ -190,7 +212,7 @@ currents_columns = ["Velocity 1 (m/s)", "Velocity 2 (m/s)", "Velocity 3 (m/s)", 
 waves_columns = waves_data.columns[1:6]
 
 # Load wind data
-wind_data = process_wind_data(WIND_DATA_DIR)
+# wind_data = process_wind_data(WIND_DATA_DIR)
 
 # Correctly parse the 'Time and Date' column as datetime
 wind_data['datetime'] = pd.to_datetime(wind_data['Time and Date'], errors='coerce')
@@ -201,11 +223,9 @@ wind_data[['latitude', 'longitude']] = wind_data['GPS'].str.split(' ', expand=Tr
 # Heights for wind speed and wind direction
 heights = [257, 227, 197, 177, 157, 137, 127, 107, 87, 57, 38]
 
-
-
-# Initialize the app with Bootstrap theme
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SUPERHERO])
-server = app.server
+scheduler_thread = threading.Thread(target=run_daily_task)
+scheduler_thread.daemon = True  # Set as a daemon so it won't prevent the app from exiting
+scheduler_thread.start()
 
 # Layout of the dashboard using Bootstrap components
 app.layout = dbc.Container([
@@ -550,9 +570,4 @@ def update_hs_kde(_):
 
 # Start the app
 if __name__ == "__main__":
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(scheduled_task, 'cron', hour=2, minute=20)
-    scheduler.start()
     app.run_server(debug=False)
-    # port = int(os.environ.get("PORT", 8050))
-    # app.run_server(host="0.0.0.0", port=port)

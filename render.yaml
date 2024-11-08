@@ -1,0 +1,42 @@
+version: "1"
+
+services:
+  - type: web
+    name: green_dash_app
+    runtime: python
+    repo: https://github.com/zubair-hash/green_dash_app
+    plan: starter
+    envVars:
+      - key: PORT
+        sync: false
+      - key: REMOTE_FILE_PATH
+        sync: false
+      - key: SFTP_PASSWORD
+        sync: false
+      - key: SFTP_USERNAME
+        sync: false
+      - key: SFTP_HOST
+        sync: false
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:server --bind 0.0.0.0:8050
+    autoDeploy: false
+
+  - type: cron
+    name: green_dash_app_cron
+    runtime: python
+    repo: https://github.com/zubair-hash/green_dash_app
+    plan: starter
+    envVars:
+      - key: REMOTE_FILE_PATH
+        sync: false
+      - key: SFTP_PASSWORD
+        sync: false
+      - key: SFTP_USERNAME
+        sync: false
+      - key: SFTP_HOST
+        sync: false
+    region: frankfurt
+    buildCommand: pip install -r server_requirements.txt
+    startCommand: uvicorn data_job:app --reload --host 0.0.0.0 --port 8000
+    schedule: 1-10 0 * * *

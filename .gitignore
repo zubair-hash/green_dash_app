@@ -9,8 +9,8 @@
 .DS_Store
 
 # Datafiles
-/data/
-/cache/
+data/
+cache/
 # Windows
 Thumbs.db
 

@@ -48,7 +48,8 @@ def save_to_cache(data, cache_file):
 # Fetch data functions with cache checking
 def fetch_data(endpoint, cache_file):
     if is_cache_expired(cache_file):
-        url = f"http://localhost:8000/data/{endpoint}"
+        API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+        url = f"{API_BASE_URL}/data/{endpoint}"
         response = requests.get(url)
         data = pd.DataFrame(response.json())
         save_to_cache(data, cache_file)

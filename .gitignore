@@ -8,6 +8,9 @@
 # Mac/OSX
 .DS_Store
 
+# Datafiles
+/data/
+/cache/
 # Windows
 Thumbs.db
 

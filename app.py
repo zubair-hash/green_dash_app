@@ -12,189 +12,54 @@ import numpy as np
 import dash_bootstrap_components as dbc
 import paramiko
 import stat
-from dotenv import load_dotenv
-from pathlib import Path
-# from apscheduler.schedulers.background import BackgroundScheduler
-import threading
+from dotenv import load_dotenv        
+import requests
 import time
-import datetime
+import json
 
-# Load environment variables from .env file
-load_dotenv()
+# Cache file paths
+CACHE_DIR = 'cache'
+CACHE_FILE_CURRENTS = os.path.join(CACHE_DIR, 'currents_data.json')
+CACHE_FILE_WAVES = os.path.join(CACHE_DIR, 'waves_data.json')
+CACHE_FILE_WIND = os.path.join(CACHE_DIR, 'wind_data.json')
+CACHE_EXPIRY_TIME = 3600  # Cache expiry time in seconds (1 hour)
 
-# Define SFTP credentials and connection parameters from environment variables
-sftp_host = os.getenv('SFTP_HOST')
-sftp_username = os.getenv('SFTP_USERNAME')
-sftp_password = os.getenv('SFTP_PASSWORD')
-remote_base_path = os.getenv('REMOTE_FILE_PATH')  # Base path for the main directory
+# Create cache directory if it doesn't exist
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Define the local directory where you want to save the files (ephemeral on Heroku)
-local_base_directory = Path("./data")
+# Function to check if cache is expired
+def is_cache_expired(cache_file):
+    if not os.path.exists(cache_file):
+        return True
+    cache_time = os.path.getmtime(cache_file)
+    current_time = time.time()
+    return (current_time - cache_time) > CACHE_EXPIRY_TIME
 
-def get_remote_file_info(sftp, file_path):
-    """Fetch the remote file's modification time."""
-    file_attributes = sftp.stat(file_path)
-    return file_attributes.st_mtime
+# Function to load data from cache if available
+def load_cache_data(cache_file):
+    with open(cache_file, 'r') as f:
+        return pd.DataFrame(json.load(f))
 
-def get_local_file_info(local_file_path):
-    """Fetch the local file's modification time if it exists."""
-    if local_file_path.exists():
-        return local_file_path.stat().st_mtime
-    return None
+# Function to save data to cache
+def save_to_cache(data, cache_file):
+    with open(cache_file, 'w') as f:
+        json.dump(data.to_dict(orient='records'), f)
 
-def is_file_updated(local_mtime, remote_mtime):
-    """Compare local and remote modification times."""
-    return local_mtime is None or remote_mtime > local_mtime
-
-def download_file(sftp, remote_file, local_file):
-    """Download the file from the remote server."""
-    sftp.get(remote_file, str(local_file))
-    print(f"Downloaded {remote_file} to {local_file}")
-
-def is_directory(sftp, path):
-    """Check if the path is a directory on the remote server."""
-    try:
-        return stat.S_ISDIR(sftp.stat(path).st_mode)
-    except IOError:
-        return False
-
-def mirror_directory_structure(sftp, remote_dir, local_dir):
-    """Mirror the remote directory structure locally."""
-    if not local_dir.exists():
-        local_dir.mkdir(parents=True)
-        print(f"Created local directory: {local_dir}")
-
-    for item in sftp.listdir(remote_dir):
-        remote_item_path = f"{remote_dir}/{item}"
-        local_item_path = local_dir / item
-
-        if is_directory(sftp, remote_item_path):
-            mirror_directory_structure(sftp, remote_item_path, local_item_path)
-        else:
-            pass
-
-def check_subdirectory(sftp, remote_dir, local_dir):
-    """Check and download updated files from a specific subdirectory."""
-    directory_contents = sftp.listdir(remote_dir)
-
-    for item in directory_contents:
-        remote_file = f"{remote_dir}/{item}"
-        local_file = local_dir / item
-
-        if is_directory(sftp, remote_file):
-            check_subdirectory(sftp, remote_file, local_file)
-        else:
-            remote_mtime = get_remote_file_info(sftp, remote_file)
-            local_mtime = get_local_file_info(local_file)
-
-            if is_file_updated(local_mtime, remote_mtime):
-                download_file(sftp, remote_file, local_file)
-
-def process_data():
-    """Main function to check and download updated data."""
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(sftp_host, username=sftp_username, password=sftp_password)
-        sftp = ssh.open_sftp()
-
-        sftp.chdir(remote_base_path)
-        mirror_directory_structure(sftp, remote_base_path, local_base_directory)
-        check_subdirectory(sftp, remote_base_path, local_base_directory)
-
-        sftp.close()
-        ssh.close()
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-CURRENT_DATA_DIR = local_base_directory / "Current/XX03.nmea"
-WAVE_DATA_DIR = local_base_directory / "Wave/COM3_2024_09_21.txt"
-WIND_DATA_DIR = local_base_directory / "Lidar"
-
-def process_currents_data(file_path):
-    with open(file_path, 'r') as f:
-        lines = f.readlines()
-    data = [line.strip().split(',') for line in lines if line.startswith('$PNORC')]
-    df = pd.DataFrame(data)
-    df.replace('', pd.NA, inplace=True)
-    df.dropna(axis=1, how='all', inplace=True)
-
-    column_names = [
-        "Identifier", "Date", "Time", "Cell number", "Velocity 1 (m/s)", "Velocity 2 (m/s)", 
-        "Velocity 3 (m/s)", "Speed (m/s)", "Direction (°)", "Amplitude units", 
-        "Correlation 1 (%)", "Correlation 2 (%)", "Correlation 3 (%)", "Checksum (hex)"
-    ]
-
-    if df.shape[1] <= len(column_names):
-        df.columns = column_names[:df.shape[1]]
+# Fetch data functions with cache checking
+def fetch_data(endpoint, cache_file):
+    if is_cache_expired(cache_file):
+        url = f"http://localhost:8000/data/{endpoint}"
+        response = requests.get(url)
+        data = pd.DataFrame(response.json())
+        save_to_cache(data, cache_file)
     else:
-        return
+        data = load_cache_data(cache_file)
+    return data
 
-    def convert_to_datetime(row):
-        date_str = str(row['Date'])[-5:]
-        month = date_str[0].zfill(2)
-        day = date_str[1:3]
-        year = "20" + date_str[3:]
-        time_str = str(row['Time']).zfill(6)
-        hours = time_str[:2]
-        minutes = time_str[2:4]
-        seconds = time_str[4:]
-        datetime_str = f"{year}-{month}-{day} {hours}:{minutes}:{seconds}"
-        return pd.Timestamp(datetime_str)
-
-    if 'Date' in df.columns and 'Time' in df.columns:
-        df['Datetime'] = df.apply(convert_to_datetime, axis=1)
-    return df
-
-def process_wave_data(file_path):
-    with open(file_path, 'r') as f:
-        lines = f.readlines()
-    data = [line.strip().split(',') for line in lines if line.strip()]
-    df = pd.DataFrame(data)
-    column_names = ['identifier', 'NMEA', 'CompassHeading', 'Hs', 'DominantPeriod', 'DominantPeriodFW'] + \
-                   [f'parameter{i}' for i in range(6, 22)] + ['Datetime', 'parameter22']
-    df.columns = column_names
-    return df
-
-def process_wind_data(wind_data_dir):
-    csv_pattern = str(wind_data_dir / 'Wind10_829@Y2024_M09_D*.ZPH.csv')
-    all_files = glob.glob(csv_pattern)
-    if not all_files:
-        return
-    wind_data = pd.concat((pd.read_csv(f, skiprows=1) for f in all_files), ignore_index=True)
-    wind_data.replace(9999, np.nan, inplace=True)
-    wind_data.ffill(inplace=True)
-    wind_data.bfill(inplace=True)
-    return wind_data
-
-currents_data = process_currents_data(CURRENT_DATA_DIR)
-waves_data = process_wave_data(WAVE_DATA_DIR)
-wind_data = process_wind_data(WIND_DATA_DIR)
-
-def run_daily_task():
-    """Run the data loading task daily at 00:01 AM."""
-    while True:
-        now = datetime.datetime.now()
-        target_time = datetime.datetime.combine(now.date(), datetime.time(14, 0))  # 00:01 AM today
-        if now > target_time:
-            # If already past 00:01 AM today, set to 00:01 AM tomorrow
-            target_time += datetime.timedelta(days=1)
-        
-        # Calculate time to wait until target time
-        wait_time = (target_time - now).total_seconds()
-        print(f"Waiting {wait_time} seconds until the next run at {target_time}.")
-
-        time.sleep(wait_time)  # Wait until target time
-        process_data()         # Run the data loading function
-        currents_data = process_currents_data(CURRENT_DATA_DIR)
-        waves_data = process_wave_data(WAVE_DATA_DIR)
-        wind_data = process_wind_data(WIND_DATA_DIR)
-        
-
-# Initialize the app with Bootstrap theme
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SUPERHERO])
-server = app.server
+# Load initial data (with cache mechanism)
+currents_data = fetch_data("currents", CACHE_FILE_CURRENTS)
+waves_data = fetch_data("waves", CACHE_FILE_WAVES)
+wind_data = fetch_data("wind", CACHE_FILE_WIND)
 
 # Load currents data
 # currents_data = process_currents_data(CURRENT_DATA_DIR) # comment if you are loading fron the folder
@@ -223,9 +88,9 @@ wind_data[['latitude', 'longitude']] = wind_data['GPS'].str.split(' ', expand=Tr
 # Heights for wind speed and wind direction
 heights = [257, 227, 197, 177, 157, 137, 127, 107, 87, 57, 38]
 
-scheduler_thread = threading.Thread(target=run_daily_task)
-scheduler_thread.daemon = True  # Set as a daemon so it won't prevent the app from exiting
-scheduler_thread.start()
+# Initialize the app with Bootstrap theme
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SUPERHERO])
+server = app.server
 
 # Layout of the dashboard using Bootstrap components
 app.layout = dbc.Container([
